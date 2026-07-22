@@ -1,0 +1,3 @@
+The API enforces a rate limit of 100 requests per minute per API key.
+Exceeding this limit returns a 429 status code. Rate limit headers are
+included in every response to help you track your current usage.

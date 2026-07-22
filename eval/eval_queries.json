@@ -1,0 +1,30 @@
+[
+  {
+    "query": "how do I get my money back for an item I don't want",
+    "expected_file": "returns_policy.txt"
+  },
+  {
+    "query": "how long will delivery take",
+    "expected_file": "shipping_info.txt"
+  },
+  {
+    "query": "someone might have logged into my account without permission",
+    "expected_file": "account_security.txt"
+  },
+  {
+    "query": "what happens if I call the API too many times",
+    "expected_file": "api_rate_limits.txt"
+  },
+  {
+    "query": "what should a new hire do in their first days",
+    "expected_file": "onboarding_guide.txt"
+  },
+  {
+    "query": "can I send an item back after 45 days",
+    "expected_file": "returns_policy.txt"
+  },
+  {
+    "query": "protecting my login with an extra verification step",
+    "expected_file": "account_security.txt"
+  }
+]

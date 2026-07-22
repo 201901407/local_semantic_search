@@ -1,0 +1,3 @@
+New team members should complete the following steps in their first week:
+set up their development environment, request access to internal tools,
+and schedule a meeting with their onboarding buddy to review team processes.

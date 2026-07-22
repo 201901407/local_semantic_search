@@ -1,0 +1,3 @@
+To keep your account secure, we recommend enabling two-factor authentication
+in your account settings. If you suspect unauthorized access, change your
+password immediately and contact our support team.
