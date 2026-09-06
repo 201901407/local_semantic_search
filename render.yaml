@@ -1,0 +1,49 @@
+# Render deployment — static site, no backend.
+#
+# The entire application is static files. All computation happens in the
+# visitor's browser and no document ever reaches this server, so there is
+# nothing here to authenticate against and no secret to configure.
+#
+# The two cross-origin headers are NOT optional. Multi-threaded WebAssembly
+# needs SharedArrayBuffer, which a browser only grants to a cross-origin
+# isolated page. Without them the runtime silently falls back to a single
+# thread — several times slower, with no error raised anywhere. Verify after
+# deploying by checking `crossOriginIsolated` in the console; the app's header
+# tag also shows the backend and thread count.
+#
+# `credentialless` rather than `require-corp` because the model weights are
+# fetched from the HuggingFace CDN. Under require-corp that load can fail
+# unless the CDN opts in with its own header; credentialless keeps the same
+# isolation guarantee while allowing the fetch (verified locally: the page
+# stayed cross-origin isolated and throughput was unchanged).
+
+services:
+  - type: web
+    name: local-semantic-search
+    runtime: static
+    staticPublishPath: ./app
+    buildCommand: ""
+    pullRequestPreviewsEnabled: false
+
+    headers:
+      - path: /*
+        name: Cross-Origin-Opener-Policy
+        value: same-origin
+      - path: /*
+        name: Cross-Origin-Embedder-Policy
+        value: credentialless
+      # Defence in depth for a page that renders text from untrusted documents.
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: no-referrer
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+
+# Deliberately no catch-all rewrite: there is no client-side router, so every
+# URL should map to a real file. A rewrite would mask genuine 404s and hide
+# selftest.html, which is worth being able to open against the live deployment
+# to confirm the headers and the model load actually work in production.

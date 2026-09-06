@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- No CSP here: this page runs its suite from an inline module, which the app's
+     own script-src correctly forbids. Running the tests under the real policy
+     needs the suite extracted to a .js file first — until then, a CSP mistake
+     will NOT be caught here and must be checked against index.html. -->
+<style>body{font:13px/1.6 ui-monospace,Menlo,monospace;padding:20px;background:#111;color:#ddd}
+.p{color:#5ec96b}.f{color:#ff6b6b}</style></head>
+<body><pre id="out">running…</pre>
+<script>
+// Classic script so it is parsed before the module and can observe its failures.
+function report(msg){
+  var o=document.getElementById('out'); if(o) o.textContent += '\nFATAL: '+msg;
+  fetch('/result',{method:'POST',body:JSON.stringify({fatal:msg},null,2)});
+}
+window.addEventListener('error', function(e){
+  report((e.message||'error')+' @ '+(e.filename||'?')+':'+e.lineno+':'+e.colno);
+});
+window.addEventListener('unhandledrejection', function(e){
+  report('unhandled rejection: '+((e.reason&&e.reason.stack)||e.reason));
+});
+</script>
+<script type="module">
+import { inspectFile, scanExtractedText } from './src/validate.js';
+import { chunkText, normalizeWhitespace, batchesByLength } from './src/chunk.js';
+import { quantizeToInt8, VectorIndex, diversify, DIMENSIONS } from './src/search.js';
+import { selectExcerpt, queryTerms } from './src/excerpt.js';
+import { boilerplateScore, isBoilerplate } from './src/quality.js';
+import { withTimeout } from './src/timeout.js';
+import { sigmoid, controlPasses, applyRerank, RERANK_DEPTH, CONTROL,
+         CONTROL_MIN_MARGIN } from './src/rerank.js';
+import { LIMITS, sanitizeFilename, clampText, verifyDecodedText } from './src/validate.js';
+import * as store from './src/store.js';
+
+const out = document.getElementById('out'); out.textContent = '';
+const results = [];
+const say = (s) => { out.append(document.createTextNode(s + '\n')); };
+
+function check(name, condition, detail = '') {
+  results.push({ name, pass: !!condition, detail });
+  const line = document.createElement('span');
+  line.className = condition ? 'p' : 'f';
+  line.textContent = `${condition ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}\n`;
+  out.append(line);
+}
+
+const file = (bytes, name) => new File([bytes], name);
+
+try {
+  // ---------- validate ----------
+  say('— validate —');
+  check('accepts plain text .txt',
+    (await inspectFile(file('hello world, a normal note.', 'a.txt'))).ok);
+
+  const binary = new Uint8Array([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x00, 0x00, 0x00, 0x00]);
+  const bin = await inspectFile(file(binary, 'evil.txt'));
+  check('rejects binary disguised as .txt', !bin.ok, bin.reason);
+
+  const fakePdf = await inspectFile(file('#!/bin/sh\nrm -rf /\n', 'payload.pdf'));
+  check('rejects non-PDF bytes claiming .pdf', !fakePdf.ok, fakePdf.reason);
+
+  check('accepts real PDF magic', (await inspectFile(file('%PDF-1.7\nstuff', 'real.pdf'))).ok);
+  check('rejects unsupported extension', !(await inspectFile(file('x', 'a.exe'))).ok);
+  check('rejects empty file', !(await inspectFile(file('', 'a.txt'))).ok);
+  check('flags script-like content without rejecting',
+    scanExtractedText('notes <script>alert(1)<\/script> more').length === 1);
+  check('does not flag ordinary prose', scanExtractedText('just some writing').length === 0);
+
+  // ---------- chunking (needs the real tokenizer) ----------
+  say('\n— chunking —');
+  const { AutoTokenizer, env } = await import(
+    'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js');
+  env.allowRemoteModels = true; env.allowLocalModels = false;
+  const tokenizer = await AutoTokenizer.from_pretrained('Xenova/all-MiniLM-L6-v2');
+
+  const technical = 'Configure the diffusion-weighted MRI (fMRI) pipeline. '
+    + "Set retry_count=5 in config.yaml — see Dr. O'Brien's 2024 paper [ref-12].";
+  const small = await chunkText(technical, tokenizer);
+  check('short text yields one chunk', small.chunks.length === 1, `${small.chunks.length}`);
+  const preserved = ['diffusion-weighted', '(fMRI)', 'retry_count=5', 'config.yaml',
+                     "O'Brien's", '[ref-12]', 'MRI'];
+  const kept = preserved.filter((p) => small.chunks[0].text.includes(p));
+  check('chunk text is verbatim source', kept.length === preserved.length,
+    `${kept.length}/${preserved.length} patterns kept`);
+
+  const long = Array.from({ length: 400 },
+    (_, i) => `sentence number ${i} concerning distributed storage systems.`).join(' ');
+  const big = await chunkText(long, tokenizer);
+  const budgets = await Promise.all(big.chunks.map(async (c) => {
+    const enc = await tokenizer(c.text, { add_special_tokens: false });
+    return (enc.input_ids.dims ? enc.input_ids.dims[1] : enc.input_ids.length);
+  }));
+  check('every chunk within the 200-token budget',
+    budgets.every((n) => n <= 200), `max ${Math.max(...budgets)}`);
+  check('produces multiple chunks', big.chunks.length > 1, `${big.chunks.length}`);
+  check('chunks are exact substrings of normalized text',
+    big.chunks.every((c) => big.text.slice(c.start, c.end) === c.text));
+  check('consecutive chunks overlap', big.chunks[1].start < big.chunks[0].end);
+  check('covers the whole document',
+    big.chunks[0].start === 0 && big.chunks.at(-1).end === big.text.length);
+  check('normalizeWhitespace collapses runs',
+    normalizeWhitespace('  a \n\n b\t c ') === 'a b c');
+  check('batching groups by length',
+    batchesByLength(big.chunks, 64).flat().length === big.chunks.length);
+
+  // ---------- vectors ----------
+  say('\n— vectors —');
+  const raw = new Float32Array(DIMENSIONS * 3);
+  for (let i = 0; i < raw.length; i++) raw[i] = Math.sin(i) / 20;
+  const q = quantizeToInt8(raw);
+  const err = Math.max(...[...raw].map((v, i) => Math.abs(v - q.data[i] * q.scale)));
+  check('int8 quantization round-trips within one step', err <= q.scale * 1.01,
+    `max err ${err.toExponential(2)}`);
+
+  const idx = new VectorIndex();
+  idx.add('fileA', q.scale, q.data);
+  check('index counts rows', idx.count === 3);
+  const probe = new Float32Array(raw.subarray(0, DIMENSIONS));
+  const hits = idx.search(probe, 2);
+  check('search returns k hits', hits.length === 2);
+  check('best hit is the matching row', hits[0].ordinal === 0, JSON.stringify(hits[0]));
+  idx.add('fileB', q.scale, q.data);
+  check('index grows across files', idx.count === 6);
+  idx.remove('fileA');
+  check('remove drops only that file', idx.count === 3 && idx.rows.every(r => r.fileId === 'fileB'));
+  check('diversify keeps several passages per file',
+    diversify([{fileId:'a',ordinal:0,score:3},{fileId:'a',ordinal:9,score:2},
+               {fileId:'b',ordinal:0,score:1}], {maxPerFile:3, limit:8}).length === 3);
+  check('diversify drops adjacent overlapping chunks',
+    diversify([{fileId:'a',ordinal:4,score:3},{fileId:'a',ordinal:5,score:2}],
+              {maxPerFile:3, limit:8}).length === 1);
+  check('diversify prefers spreading across files',
+    diversify([{fileId:'a',ordinal:0,score:9},{fileId:'a',ordinal:4,score:8},
+               {fileId:'a',ordinal:8,score:7},{fileId:'a',ordinal:12,score:6},
+               {fileId:'b',ordinal:0,score:1}], {maxPerFile:2, limit:3})
+      .filter(h=>h.fileId==='b').length === 1);
+  check('single-document library can still fill the requested count',
+    diversify([0,2,4,6,8,10].map((o,i)=>({fileId:'a',ordinal:o,score:9-i})),
+              {maxPerFile:2, limit:5}).length === 5);
+  check('never exceeds the requested count',
+    diversify([0,2,4,6,8,10].map((o,i)=>({fileId:'a',ordinal:o,score:9-i})),
+              {maxPerFile:3, limit:2}).length === 2);
+  check('results are always in descending score order',
+    (() => {
+      const out = diversify([
+        {fileId:'a',ordinal:100,score:0.90},{fileId:'a',ordinal:200,score:0.86},
+        {fileId:'a',ordinal:300,score:0.82},{fileId:'a',ordinal:400,score:0.78},
+        {fileId:'b',ordinal:0,score:0.40},
+      ], {maxPerFile:3, limit:5}).map(h=>h.score);
+      return out.every((s,i) => i === 0 || out[i-1] >= s);
+    })());
+  check('second pass never repeats a chunk',
+    new Set(diversify([0,2,4,6].map((o,i)=>({fileId:'a',ordinal:o,score:9-i})),
+              {maxPerFile:1, limit:4}).map(h=>h.ordinal)).size === 4);
+
+  // ---------- excerpt selection (regression: DDIA "consistent hashing") ----------
+  say('\n— excerpt —');
+  const terms = queryTerms('how does consistent hashing work');
+  check('stopwords removed from query terms',
+    !terms.includes('how') && !terms.includes('does'), terms.join(','));
+  check('specific terms kept', terms.includes('consistent') && terms.includes('hashing'));
+
+  const passage = 'This is illustrated in Figure 6-3. Partitioning of Key-Value Data | 203 '
+    + 'Figure 6-3. Partitioning by hash of key. This technique is good at distributing keys '
+    + 'fairly among the partitions. The partition boundaries can be evenly spaced, or they can '
+    + 'be chosen pseudorandomly (in which case the technique is sometimes known as consistent '
+    + 'hashing). Consistent Hashing Consistent hashing, as defined by Karger et al., is a way '
+    + 'of evenly distributing load across an internet-wide system of caches such as a content '
+    + 'delivery network. It uses randomly chosen partition boundaries to avoid the need for '
+    + 'central control or distributed consensus.';
+  const shown = selectExcerpt(passage, terms);
+  check('excerpt reaches the definition, not just the figure caption',
+    shown.includes('as defined by Karger'), shown.slice(0, 70) + '…');
+  check('excerpt respects the length budget', shown.length <= 430, `${shown.length}`);
+  check('excerpt marks that it was cut', shown.startsWith('…'));
+  check('short passages pass through untouched',
+    selectExcerpt('a short passage', terms) === 'a short passage');
+  check('no query terms still yields an excerpt',
+    selectExcerpt(passage, ['zzz']).length > 0);
+
+  // ---------- boilerplate detection ----------
+  say('\n— boilerplate —');
+  const bibliography = 'tin.kleppmann.com, June 18, 2012. [7] David Karger, Eric Lehman, '
+    + 'Tom Leighton, et al.: \u201C Consistent Hashing and Random Trees: Distributed Caching '
+    + 'Protocols for Relieving Hot Spots on the World Wide Web ,\u201D at 29th Annual ACM Symposium '
+    + 'on Theory of Computing (STOC), May 1997. [8] John Lamping and Eric Veach: 2014.';
+  const contents = '. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 553 Index. '
+    + '. . . . . . . . . . . . . . . . 489 Data Integration 490 Combining Specialized Tools 491';
+  const plainProse = 'Consistent hashing, as defined by Karger, is a way of evenly distributing load '
+    + 'across an internet-wide system of caches. It uses randomly chosen partition boundaries '
+    + 'to avoid the need for central control or distributed consensus.';
+  const crossRef = 'consistency and the issue of eventual consistency that arises in '
+    + 'asynchronously replicated systems (see Problems with Replication Lag on page 161). '
+    + 'Consistent hashing is an approach to partitioning that some systems use for rebalancing.';
+
+  check('flags a bibliography entry', isBoilerplate(bibliography),
+    `score ${boilerplateScore(bibliography).toFixed(1)}`);
+  check('flags table-of-contents dot leaders', isBoilerplate(contents),
+    `score ${boilerplateScore(contents).toFixed(1)}`);
+  check('keeps ordinary prose', !isBoilerplate(plainProse),
+    `score ${boilerplateScore(plainProse).toFixed(1)}`);
+  check('keeps prose that carries page cross-references', !isBoilerplate(crossRef),
+    `score ${boilerplateScore(crossRef).toFixed(1)}`);
+  check('furniture scores far above prose',
+    boilerplateScore(bibliography) > boilerplateScore(crossRef) * 2);
+
+  check('boilerplate is held back when real content exists',
+    diversify([{fileId:'a',ordinal:0,score:0.9,boiler:true},
+               {fileId:'a',ordinal:5,score:0.5,boiler:false}],
+              {maxPerFile:3, limit:1})[0].ordinal === 5);
+  check('boilerplate still surfaces when nothing else is left',
+    diversify([{fileId:'a',ordinal:0,score:0.9,boiler:true}],
+              {maxPerFile:3, limit:3}).length === 1);
+  check('held-back boilerplate still sorts by score when included',
+    (() => {
+      const out = diversify([{fileId:'a',ordinal:0,score:0.9,boiler:true},
+                             {fileId:'a',ordinal:5,score:0.5,boiler:false}],
+                            {maxPerFile:3, limit:2}).map(h=>h.score);
+      return out[0] === 0.9 && out[1] === 0.5;
+    })());
+
+  // ---------- bounded work ----------
+  say('\n— limits and timeouts —');
+  check('fast work passes through a deadline',
+    await withTimeout(Promise.resolve('ok'), 1000, 'x') === 'ok');
+  check('slow work is rejected', await (async () => {
+    try { await withTimeout(new Promise(r => setTimeout(r, 400)), 60, 'Indexing'); return false; }
+    catch (e) { return /timed out/.test(e.message); }
+  })());
+  check('timeout error names the step', await (async () => {
+    try { await withTimeout(new Promise(() => {}), 30, 'Reading the document'); return false; }
+    catch (e) { return e.message.startsWith('Reading the document'); }
+  })());
+  check('a rejection still propagates', await (async () => {
+    try { await withTimeout(Promise.reject(new Error('boom')), 1000, 'x'); return false; }
+    catch (e) { return e.message === 'boom'; }
+  })());
+
+  check('clampText enforces the ceiling', (() => {
+    const r = clampText('x'.repeat(LIMITS.maxTextChars + 5000));
+    return r.clamped && r.text.length === LIMITS.maxTextChars;
+  })());
+  check('clampText leaves normal text alone',
+    clampText('a short document').text === 'a short document');
+  check('NUL bytes rejected after decoding',
+    !verifyDecodedText('clean prose\u0000\u0001binary').ok);
+  check('ordinary text passes the decoded check',
+    verifyDecodedText('An ordinary paragraph.\nWith a newline.\tAnd a tab.').ok);
+  check('bidi override stripped from filenames',
+    sanitizeFilename('report\u202Efdp.txt') === 'reportfdp.txt');
+  check('ordinary filenames untouched',
+    sanitizeFilename('Designing Data-Intensive Applications.pdf')
+      === 'Designing Data-Intensive Applications.pdf');
+  check('per-drop limits are defined',
+    LIMITS.maxFilesPerDrop > 0 && LIMITS.maxBytesPerDrop > 0
+    && LIMITS.batchTimeoutMs > 0 && LIMITS.extractTimeoutMs > LIMITS.batchTimeoutMs);
+
+  // ---------- store ----------
+  say('\n— store —');
+  await store.clearAll();
+  await store.putFile({ id: 'f1', name: 'note.txt', chunkCount: 2, status: 'indexed' });
+  await store.putIndexedFile('f1',
+    [{ text: 'first passage', start: 0, end: 13 }, { text: 'second passage', start: 14, end: 28 }],
+    { scale: q.scale, data: q.data.slice(0, DIMENSIONS * 2) });
+  check('file persisted', (await store.listFiles()).length === 1);
+  check('chunks persisted', (await store.getChunksFor('f1')).length === 2);
+  check('single chunk fetch works', (await store.getChunk('f1:1')).text === 'second passage');
+  check('vectors persisted', (await store.getAllVectors())[0].data.length === DIMENSIONS * 2);
+  await store.deleteFile('f1');
+  check('delete removes file', (await store.listFiles()).length === 0);
+  check('delete cascades to chunks', (await store.getChunksFor('f1')).length === 0);
+  check('delete cascades to vectors', (await store.getAllVectors()).length === 0);
+
+  // ---------- worker end to end ----------
+  say('\n— worker end to end —');
+  const worker = new Worker('./worker.js', { type: 'module' });
+  const prose = 'The refund window is thirty days from delivery. '
+    + 'Rate limits are enforced per API key on a rolling window. '
+    + 'Enable two-factor authentication to protect your account login. '
+    + 'Shipping to remote regions may take up to fourteen business days.';
+  const buffer = new TextEncoder().encode(prose).buffer;
+
+  const indexed = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('worker timeout')), 120000);
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'ready') say(`  backend: ${data.backend}/${data.dtype}, `
+        + `threads ${data.threads}, isolated ${data.crossOriginIsolated}`);
+      if (data.type === 'indexed') { clearTimeout(timer); resolve(data); }
+      if (data.type === 'error') { clearTimeout(timer); reject(new Error(data.message)); }
+    };
+    worker.postMessage({ type: 'index', fileId: 'w1', name: 'notes.txt', kind: 'txt', buffer },
+                       [buffer]);
+  });
+  check('worker indexed the document', indexed.chunks.length > 0, `${indexed.chunks.length} chunks`);
+  check('worker returned int8 vectors',
+    indexed.data.length === indexed.chunks.length * DIMENSIONS);
+
+  // ---------- rerank ----------
+  say('\n— rerank —');
+
+  check('depth is the measured 30', RERANK_DEPTH === 30, String(RERANK_DEPTH));
+  check('sigmoid maps 0 to one half', Math.abs(sigmoid(0) - 0.5) < 1e-12);
+  check('sigmoid is monotone, so it cannot reorder',
+    sigmoid(-11) < sigmoid(-1) && sigmoid(-1) < sigmoid(0) && sigmoid(0) < sigmoid(11));
+  check('sigmoid stays inside 0..1 at extremes',
+    sigmoid(-800) >= 0 && sigmoid(800) <= 1 && Number.isFinite(sigmoid(800)));
+
+  // The measured margin for a working int8 model is 10.27; noise is near zero.
+  check('control passes for a working model (margin 10.3)',
+    controlPasses(-0.884, -11.155));
+  check('control fails for noise (margin ~0)', !controlPasses(0.02, 0.01));
+  check('control fails when the pair is inverted', !controlPasses(-11.155, -0.884));
+  check('control fails on NaN rather than passing by accident',
+    !controlPasses(NaN, -11.155) && !controlPasses(0, NaN));
+  check('control threshold sits below a real signal and above noise',
+    CONTROL_MIN_MARGIN > 1 && CONTROL_MIN_MARGIN < 10.27, String(CONTROL_MIN_MARGIN));
+  check('control passages are genuinely unrelated',
+    CONTROL.relevant.includes('Replication') && CONTROL.irrelevant.includes('oven'));
+
+  const retrieved = [
+    { fileId: 'a', ordinal: 0, score: 0.90 },
+    { fileId: 'a', ordinal: 1, score: 0.80 },
+    { fileId: 'b', ordinal: 2, score: 0.70 },
+  ];
+  const reordered = applyRerank(retrieved, [-2, 5, 1]);       // second passage wins
+  check('rerank reorders by cross-encoder score',
+    reordered.map((h) => h.ordinal).join(',') === '1,2,0',
+    reordered.map((h) => h.ordinal).join(','));
+  check('rerank output is sorted descending',
+    reordered.every((h, i) => i === 0 || reordered[i - 1].score >= h.score));
+  check('rerank marks what it rescored', reordered.every((h) => h.reranked === true));
+  check('rerank does not mutate the retrieval order',
+    retrieved.map((h) => h.ordinal).join(',') === '0,1,2');
+  check('rerank keeps hits it has no score for',
+    applyRerank(retrieved, [5]).length === 3);
+  check('unscored hits are not marked reranked',
+    applyRerank(retrieved, [5]).filter((h) => h.reranked).length === 1);
+  check('rerank preserves the passage text identity',
+    reordered.every((h) => retrieved.some((r) => r.fileId === h.fileId && r.ordinal === h.ordinal)));
+  check('rerank has a bounded deadline like every other step',
+    LIMITS.rerankTimeoutMs > 0 && LIMITS.rerankTimeoutMs <= 60000,
+    String(LIMITS.rerankTimeoutMs));
+
+  const live = new VectorIndex();
+  live.add('w1', indexed.scale, indexed.data);
+  const vector = await new Promise((resolve, reject) => {
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'queryEmbedding') resolve(data.vector);
+      if (data.type === 'error') reject(new Error(data.message));
+    };
+    worker.postMessage({ type: 'query', text: 'how do I get my money back' });
+  });
+  const top = live.search(vector, 1)[0];
+  const text = indexed.chunks[top.ordinal].text;
+  check('semantic query retrieves the refund passage',
+    text.toLowerCase().includes('refund'), text.slice(0, 60));
+
+  // The cross-encoder actually loading and scoring in a browser is the one thing
+  // no unit test can stand in for. This downloads 23 MB the first time.
+  say('\n— reranker end to end —');
+  const passages = [CONTROL.irrelevant, CONTROL.relevant];
+  const rescored = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('rerank timeout')), 180000);
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'reranked') { clearTimeout(timer); resolve(data); }
+      if (data.type === 'rerankFailed' || data.type === 'error') {
+        clearTimeout(timer); reject(new Error(data.message));
+      }
+    };
+    worker.postMessage({ type: 'rerank', token: 1, query: CONTROL.query, passages });
+  });
+  check('reranker loaded and passed its own control on this device',
+    Array.isArray(rescored.logits) && rescored.logits.length === 2,
+    JSON.stringify(rescored.logits?.map?.((l) => Number(l.toFixed(2)))));
+  check('reranker scores the relevant passage above the irrelevant one',
+    rescored.logits[1] > rescored.logits[0],
+    `${rescored.logits[1].toFixed(2)} vs ${rescored.logits[0].toFixed(2)}`);
+  check('reranker margin clears the control threshold',
+    rescored.logits[1] - rescored.logits[0] >= CONTROL_MIN_MARGIN,
+    (rescored.logits[1] - rescored.logits[0]).toFixed(2));
+  check('applyRerank puts the relevant passage first',
+    applyRerank([{ ordinal: 0 }, { ordinal: 1 }], rescored.logits)[0].ordinal === 1);
+
+  worker.terminate();
+} catch (error) {
+  check('suite completed without throwing', false, error?.stack ?? String(error));
+}
+
+const failed = results.filter((r) => !r.pass);
+say(`\n${results.length - failed.length}/${results.length} passed`);
+await fetch('/result', { method: 'POST', body: JSON.stringify(
+  { total: results.length, failed: failed.length, failures: failed }, null, 2) });
+</script>
+</body></html>

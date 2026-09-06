@@ -9,3 +9,15 @@ venv/
 .coverage
 htmlcov/
 .DS_Store
+
+# vendored benchmark model weights (158MB, re-fetch via bench/ export script)
+bench/models/
+bench/result.json
+bench/*.log
+
+# app self-test artifacts
+app/result.json
+app/*.log
+
+# large adversarial fixture — attacktest.html synthesises it in the page
+app/attack/huge.txt

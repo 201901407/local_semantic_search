@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Semantic Search</title>
+<meta name="description" content="Search your documents by meaning. Everything stays in your browser.">
+<!--
+  No connect-src for our own origin is needed: there is no backend. Scripts and
+  model weights come from two pinned CDNs. Crucially there is no 'unsafe-inline'
+  for scripts, so even if a document's text reached the DOM as markup it could
+  not execute — a second line of defence behind textContent-only rendering.
+-->
+<!-- connect-src is the last line of defence for this app's central promise: if any
+     script here were ever compromised, this is what stops a document being sent
+     anywhere. So it names exact hosts and uses no wildcard: a wildcard over hf.co
+     would span HuggingFace's user-content surface, which is precisely where an
+     attacker could stand up a receiver.
+     Verified by cspcheck.html, which loads BOTH models under this exact policy.
+     If HuggingFace rotates CDN hosts this fails loudly at model load, and the fix
+     is to add the one observed host here -- not to widen it pre-emptively. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' https://cdn.jsdelivr.net;
+  worker-src 'self' blob: https://cdn.jsdelivr.net;
+  connect-src https://cdn.jsdelivr.net https://huggingface.co
+              https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.hf.co;
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data:;
+  base-uri 'none';
+  form-action 'none';
+">
+<style>
+  :root{
+    --bg:#F7F8FA; --panel:#FFFFFF; --sunk:#EDF0F4; --line:#DCE2EA;
+    --ink:#161A20; --muted:#616B7A; --accent:#2F5FD0; --accent-soft:#E7EDFB;
+    --ok:#1C7A52; --warn:#A8521C; --danger:#B3271E;
+    --radius:8px;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --bg:#0E1116; --panel:#161B22; --sunk:#1D242E; --line:#2C343F;
+      --ink:#E4E8EE; --muted:#98A2B0; --accent:#7CA5F5; --accent-soft:#1A2436;
+      --ok:#4FBE8B; --warn:#DE9257; --danger:#F08379;
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:var(--bg); color:var(--ink); padding:32px 20px 80px;
+    font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .app{max-width:860px;margin:0 auto;display:flex;flex-direction:column;gap:20px}
+
+  header{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  h1{font-size:21px;font-weight:650;margin:0;letter-spacing:-.01em}
+  .tag{font-size:12px;color:var(--muted);border:1px solid var(--line);
+       padding:2px 8px;border-radius:99px}
+  .spacer{flex:1}
+  .stats{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius)}
+
+  /* ---------- drop zone ---------- */
+  #drop{
+    padding:26px;text-align:center;border:1.5px dashed var(--line);
+    border-radius:var(--radius);background:var(--panel);
+    transition:border-color .15s,background .15s;cursor:pointer;
+  }
+  #drop:hover,#drop:focus-visible{border-color:var(--accent);outline:none}
+  #drop.over{border-color:var(--accent);background:var(--accent-soft)}
+  #drop h2{margin:0 0 4px;font-size:15.5px;font-weight:600}
+  #drop p{margin:0;font-size:13px;color:var(--muted)}
+  #picker{display:none}
+
+  /* ---------- search ---------- */
+  .searchbar{display:flex;gap:8px;align-items:center;
+             background:var(--panel);border:1px solid var(--line);
+             border-radius:var(--radius);padding:0 12px}
+  .searchbar:focus-within{border-color:var(--accent)}
+  #query{flex:1;border:0;background:none;color:inherit;font:inherit;
+         padding:13px 0;outline:none}
+  #query::placeholder{color:var(--muted)}
+  .kbd{font:11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);
+       border:1px solid var(--line);border-radius:4px;padding:3px 5px}
+
+  /* ---------- lists ---------- */
+  .rows{display:flex;flex-direction:column}
+  .row{display:flex;align-items:center;gap:12px;padding:11px 14px;
+       border-bottom:1px solid var(--line);font-size:14px}
+  .row:last-child{border-bottom:0}
+  .row .name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .row .meta{font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums;
+             white-space:nowrap}
+  .pill{font-size:11px;padding:2px 7px;border-radius:99px;white-space:nowrap;
+        background:var(--sunk);color:var(--muted)}
+  .pill.ok{background:var(--accent-soft);color:var(--accent)}
+  .pill.warn{color:var(--warn)}
+  .pill.bad{color:var(--danger)}
+
+  button{font:inherit;color:inherit;background:var(--panel);cursor:pointer;
+         border:1px solid var(--line);border-radius:6px;padding:6px 11px;font-size:13px}
+  button:hover{border-color:var(--accent);color:var(--accent)}
+  button:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .icon{border:0;background:none;color:var(--muted);padding:4px 7px;font-size:16px;line-height:1}
+  .icon:hover{color:var(--danger)}
+
+  /* ---------- progress ---------- */
+  .bar{height:4px;background:var(--sunk);border-radius:99px;overflow:hidden;margin-top:8px}
+  .bar>span{display:block;height:100%;width:0;background:var(--accent);
+            transition:width .25s ease}
+  .status{padding:14px}
+  .jobhead{display:flex;align-items:flex-start;gap:12px}
+  .jobhead>div{flex:1;min-width:0}
+  .status h3{margin:0 0 2px;font-size:14px;font-weight:600}
+  .status p{margin:0;font-size:12.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+
+  /* ---------- results ---------- */
+  .result{padding:15px 16px;border-bottom:1px solid var(--line)}
+  .result:last-child{border-bottom:0}
+  .result .head{display:flex;gap:10px;align-items:baseline;margin-bottom:5px}
+  .result .src{font-size:12.5px;color:var(--accent);font-weight:550;
+               overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .result .score{margin-left:auto;font:11.5px/1 ui-monospace,Menlo,monospace;
+                 color:var(--muted);font-variant-numeric:tabular-nums}
+  .result .text{font-size:14px;line-height:1.6;color:var(--ink)}
+  .result mark{background:var(--accent-soft);color:inherit;border-radius:2px;padding:0 1px}
+
+  .resultbar{display:flex;align-items:center;gap:10px;padding:9px 14px;
+             border-bottom:1px solid var(--line);font-size:12.5px;color:var(--muted)}
+  .resultbar>span:first-child{flex:1}
+  .resultbar label{white-space:nowrap}
+  .resultbar output{font-variant-numeric:tabular-nums;min-width:1.2em;
+                    text-align:right;color:var(--ink);font-weight:600}
+  #limit{width:104px;accent-color:var(--accent);cursor:pointer}
+  #limit:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+
+  .toggle{display:flex;align-items:center;gap:6px;white-space:nowrap;cursor:pointer}
+  .toggle input{accent-color:var(--accent);cursor:pointer;margin:0}
+  .toggle input:disabled,.toggle input:disabled+span{cursor:not-allowed;opacity:.5}
+  .toggle input:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+  /* A quiet pulse while the cross-encoder is scoring; results are already shown. */
+  #rerank-row[data-state="working"] span{color:var(--accent);
+       animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.45}}
+  @media (prefers-reduced-motion:reduce){#rerank-row[data-state="working"] span{animation:none}}
+  #rerank-note{color:var(--warn,#b45309)}
+
+  .empty{padding:30px 20px;text-align:center;color:var(--muted);font-size:13.5px}
+  .note{font-size:12.5px;color:var(--muted);padding:10px 14px;
+        border-top:1px solid var(--line)}
+  .noterow{display:flex;align-items:center;gap:12px}
+  .noterow span{flex:1}
+  .linkish{border:0;background:none;color:var(--muted);padding:2px 4px;
+           font-size:12.5px;text-decoration:underline;text-underline-offset:2px}
+  .linkish:hover{color:var(--danger)}
+  [hidden]{display:none !important}
+  @media (max-width:560px){ body{padding:20px 14px 60px} }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header>
+    <h1>Local Semantic Search</h1>
+    <span class="tag" id="backend">starting…</span>
+    <span class="spacer"></span>
+    <span class="stats" id="stats"></span>
+    <span class="tag" id="origin" title="Your index belongs to this address."></span>
+  </header>
+
+  <div id="drop" class="panel" tabindex="0" role="button"
+       aria-label="Add documents. Drag files here or press Enter to browse.">
+    <h2>Drop documents here</h2>
+    <p>PDF, DOCX, TXT, MD &middot; nothing is uploaded — indexing happens in this browser</p>
+    <input type="file" id="picker" multiple accept=".pdf,.docx,.txt,.md">
+  </div>
+
+  <section id="job" class="panel status" hidden aria-live="polite">
+    <div class="jobhead">
+      <div>
+        <h3 id="job-title">Indexing</h3>
+        <p id="job-detail"></p>
+      </div>
+      <button id="cancel" type="button">Stop</button>
+    </div>
+    <div class="bar"><span id="job-bar"></span></div>
+  </section>
+
+  <section class="panel" id="library" hidden>
+    <div class="rows" id="files"></div>
+    <div class="note noterow">
+      <span id="library-note"></span>
+      <button id="clear" class="linkish" type="button">Clear all</button>
+    </div>
+  </section>
+
+  <div class="searchbar">
+    <input id="query" type="search" autocomplete="off" spellcheck="false"
+           placeholder="Search by meaning — try a question" aria-label="Search">
+    <span class="kbd">/</span>
+  </div>
+
+  <section class="panel" id="results" aria-live="polite">
+    <div class="resultbar" id="resultbar" hidden>
+      <span id="results-count"></span>
+      <label class="toggle" id="rerank-row" data-state="off"
+             title="Rescores the top 30 passages with a second model that reads the query and passage together. More accurate, about a second slower, and downloads 23 MB the first time.">
+        <input type="checkbox" id="rerank">
+        <span>Rerank</span>
+      </label>
+      <label for="limit">Show</label>
+      <input type="range" id="limit" min="1" max="10" step="1" value="5"
+             aria-label="Number of results to show">
+      <output id="limit-value" for="limit">5</output>
+    </div>
+    <div class="note" id="rerank-note" hidden></div>
+    <div class="empty" id="results-empty">Add a document to start searching.</div>
+    <div id="results-list"></div>
+  </section>
+
+</div>
+<script type="module" src="./src/app.js"></script>
+</body>
+</html>

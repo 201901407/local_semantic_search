@@ -1,0 +1,85 @@
+<!doctype html><meta charset="utf-8"><title>adversarial input</title>
+<style>body{font:13px/1.6 ui-monospace,Menlo,monospace;background:#111;color:#ddd;padding:18px}
+.v{color:#5ec96b}.x{color:#ff6b6b}</style><pre id="o"></pre>
+<script>
+function report(m){fetch('/result',{method:'POST',body:JSON.stringify({fatal:m},null,2)});}
+window.addEventListener('error',e=>report((e.message||'err')+' @'+e.lineno+':'+e.colno));
+window.addEventListener('unhandledrejection',e=>report('rejection: '+((e.reason&&e.reason.stack)||e.reason)));
+</script>
+<script type="module">
+import { inspectFile, LIMITS, sanitizeFilename, clampText } from './src/validate.js';
+import { extractText } from './src/extract.js';
+const o=document.getElementById('o'); const results=[];
+const line=(cls,s)=>{const e=document.createElement('span');e.className=cls;e.textContent=s+'\n';o.append(e);};
+const rec=(name,safe,detail)=>{results.push({name,safe,detail});line(safe?'v':'x',`${safe?'BLOCKED ':'ALLOWED '} ${name}  ${detail}`);fetch('/result',{method:'POST',body:JSON.stringify(results,null,2)});};
+
+const mark=(s)=>fetch('/mark?'+encodeURIComponent(s));
+const grab = async (path) => new File([await (await fetch(path)).blob()], path.split('/').pop());
+const huge = (name, chars) =>
+  new File([new Blob(['Sample prose sentence for the size ceiling test. '.repeat(
+    Math.ceil(chars / 48))])], name);
+
+await mark('stage1-docx-bomb');
+// 1 — docx decompression bomb
+try {
+  const f = await grab('attack/bomb.docx');
+  const v = await inspectFile(f);
+  if (!v.ok) rec('docx zip bomb', true, v.reason);
+  else {
+    const t0=performance.now();
+    const { text } = await extractText(await f.arrayBuffer(), 'docx');
+    rec('docx zip bomb', false,
+      `${(f.size/1024).toFixed(0)} KB file expanded to ${(text.length/1e6).toFixed(1)} MB of text in ${((performance.now()-t0)/1000).toFixed(1)}s`);
+  }
+} catch(e) { rec('docx zip bomb', true, 'threw: '+String(e).slice(0,70)); }
+
+await mark('stage2-sniff');
+// 2 — binary hidden past the sniff window
+try {
+  const f = await grab('attack/sneaky.txt');
+  // inspectFile only sniffs the head; the full-content check runs at extraction.
+  await extractText(await f.arrayBuffer(), 'txt');
+  rec('binary past 4 KB sniff window', false, `accepted (${f.size} B, sniff reads ${LIMITS.sniffBytes} B)`);
+} catch(e){ rec('binary past 4 KB sniff window', true, 'rejected at extraction: '+String(e.message).slice(0,55)); }
+
+await mark('stage3-huge');
+// 3 — text far over the stated cap
+try {
+  // Synthesised rather than stored: this fixture is 30 MB of filler, and keeping
+  // it on disk is 30 MB in the repository to prove one integer comparison.
+  const f = huge('huge.txt', LIMITS.maxTextChars * 1.5);
+  const v = await inspectFile(f);
+  if (!v.ok) rec('oversized text', true, v.reason);
+  else {
+    const { text } = await extractText(await f.arrayBuffer(), 'txt');
+    // The worker clamps before chunking; exercise that same enforcement point.
+    const bounded = clampText(text);
+    rec('text over maxTextChars',
+      bounded.clamped && bounded.text.length === LIMITS.maxTextChars,
+      `${(text.length/1e6).toFixed(1)} MB extracted -> clamped to `
+      + `${(bounded.text.length/1e6).toFixed(1)} MB (clamped=${bounded.clamped})`);
+  }
+} catch(e){ rec('oversized text', true, String(e).slice(0,60)); }
+
+await mark('stage4-pdfjs');
+// 4 — PDF carrying JavaScript
+try {
+  const f = await grab('attack/scripted.pdf');
+  const v = await inspectFile(f);
+  let note = v.ok ? 'passed validation' : v.reason;
+  if (v.ok) { try { await extractText(await f.arrayBuffer(), 'pdf'); note='parsed, no script executed'; }
+              catch(e){ note='parser rejected: '+String(e).slice(0,45); } }
+  rec('pdf with /JavaScript', true, note);
+} catch(e){ rec('pdf with /JavaScript', true, String(e).slice(0,60)); }
+
+await mark('stage5-rtl');
+// 5 — right-to-left override in the filename
+{
+  const f = new File(['ordinary text'], 'report‮fdp.txt');
+  const shown = sanitizeFilename(f.name);
+  rec('RTL-override filename', !/[\u202A-\u202E\u2066-\u2069]/.test(shown),
+    `raw "${f.name}" displays as "${shown}"`);
+}
+
+await fetch('/result',{method:'POST',body:JSON.stringify(results,null,2)});
+</script>

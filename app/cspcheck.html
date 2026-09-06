@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CSP check</title>
+<!-- index.html's policy verbatim, plus 'self' so this page can POST its own
+     result to the dev server. The app needs no 'self': it has no backend. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' https://cdn.jsdelivr.net;
+  worker-src 'self' blob: https://cdn.jsdelivr.net;
+  connect-src 'self' https://cdn.jsdelivr.net https://huggingface.co
+              https://cdn-lfs.huggingface.co https://cdn-lfs-us-1.hf.co;
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data:;
+  base-uri 'none';
+  form-action 'none';
+">
+<style>body{font:13px/1.6 ui-monospace,Menlo,monospace;padding:20px;
+  background:#111;color:#ddd}</style>
+</head>
+<body>
+<pre id="out">running…</pre>
+<script type="module" src="./cspcheck.js"></script>
+</body>
+</html>
