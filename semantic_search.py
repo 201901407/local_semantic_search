@@ -74,22 +74,40 @@ def chunk_text(
     model's max sequence length (256 for all-MiniLM-L6-v2) instead of
     relying on a character-count approximation that can silently overflow
     on token-dense text (code, jargon, non-English text, etc).
+
+    Boundaries are chosen in token space, but each chunk's *text* is sliced
+    out of the original string using the tokenizer's character offsets --
+    never by decoding the token ids back into text.
+
+    Why that distinction matters: this is an uncased WordPiece tokenizer, so
+    decoding a window round-trips through a lossy normalization. Casing is
+    destroyed and punctuation is re-spaced, turning "config.yaml" into
+    "config. yaml", "retry_count=5" into "retry _ count = 5", and "(fMRI)"
+    into "( fmri )". Retrieval is unaffected -- the embedding is computed
+    from tokens either way -- but this text is what gets displayed as the
+    search-result excerpt, and mangling identifiers and filenames is exactly
+    the wrong thing to do in a tool for searching technical documents.
+
+    Requires a "fast" tokenizer (one that can report offset mappings), which
+    is what sentence-transformers loads by default.
     """
     text = " ".join(text.split())  # normalize whitespace
     if not text:
         return []
 
-    # Tokenize once; encode/decode lets us cut precisely on token boundaries.
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
-    if not token_ids:
+    # Tokenize once, keeping each token's (start, end) span in `text` so we
+    # can cut on token boundaries while returning verbatim source text.
+    encoding = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = [(a, b) for a, b in encoding["offset_mapping"] if b > a]
+    if not offsets:
         return []
 
     chunks = []
     start = 0
     step = max(max_tokens - overlap_tokens, 1)  # guard against overlap >= max_tokens
-    while start < len(token_ids):
-        window = token_ids[start:start + max_tokens]
-        chunks.append(tokenizer.decode(window))
+    while start < len(offsets):
+        window = offsets[start:start + max_tokens]
+        chunks.append(text[window[0][0]:window[-1][1]])
         start += step
     return chunks
 

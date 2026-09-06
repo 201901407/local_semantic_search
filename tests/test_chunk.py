@@ -13,17 +13,27 @@ from semantic_search import chunk_text, file_hash, extract_text
 
 class FakeTokenizer:
     """
-    A minimal stand-in for a HuggingFace tokenizer, so we can test the
+    A minimal stand-in for a HuggingFace *fast* tokenizer, so we can test the
     *chunking logic* (windowing, overlap, boundaries) without downloading
     a real model. Treats each whitespace-separated word as one token —
     good enough to verify chunk_text's behavior in isolation.
+
+    Like a real fast tokenizer, calling it returns an offset mapping: the
+    (start, end) character span of each token in the input. chunk_text uses
+    those spans to slice verbatim source text rather than decoding tokens
+    back into a lossily-normalized string.
     """
+
+    def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+        offsets, pos = [], 0
+        for word in text.split():
+            start = text.index(word, pos)
+            offsets.append((start, start + len(word)))
+            pos = start + len(word)
+        return {"offset_mapping": offsets}
 
     def encode(self, text, add_special_tokens=False):
         return text.split()  # "tokens" are just words here
-
-    def decode(self, tokens):
-        return " ".join(tokens)
 
 
 @pytest.fixture

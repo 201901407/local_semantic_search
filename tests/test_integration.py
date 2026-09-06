@@ -96,3 +96,48 @@ def test_unchanged_file_is_skipped_on_reindex(isolated_index, tmp_path):
     count_after_second = collection.count()
 
     assert count_after_first == count_after_second
+
+# --------------------------------------------------------------------------
+# chunk_text text fidelity (regression)
+# --------------------------------------------------------------------------
+
+def test_chunk_text_preserves_source_text_verbatim():
+    """
+    Chunk text is what gets shown as the search-result excerpt, so it must be
+    the *source* text, not a decoded token stream.
+
+    chunk_text used to build chunks with tokenizer.decode(), which round-trips
+    through an uncased WordPiece normalization: casing is destroyed and
+    punctuation is re-spaced ("config.yaml" -> "config. yaml",
+    "retry_count=5" -> "retry _ count = 5"). Retrieval was unaffected, but
+    every displayed excerpt was mangled -- worst of all for the identifiers
+    and filenames people search technical docs for.
+    """
+    from semantic_search import chunk_text, get_embedder
+
+    tokenizer = get_embedder().tokenizer
+    source = (
+        "Configure the diffusion-weighted MRI (fMRI) pipeline. "
+        "Set retry_count=5 in config.yaml — see Dr. O'Brien's 2024 paper [ref-12]."
+    )
+    chunks = chunk_text(source, tokenizer, max_tokens=200, overlap_tokens=30)
+
+    assert len(chunks) == 1
+    assert chunks[0] == source, "chunk must be the verbatim source string"
+    for fragment in ["diffusion-weighted", "(fMRI)", "retry_count=5",
+                     "config.yaml", "O'Brien's", "[ref-12]", "MRI"]:
+        assert fragment in chunks[0], f"{fragment!r} was mangled by chunking"
+
+
+def test_chunk_text_windows_stay_within_token_budget():
+    """Offset slicing must still respect the model's max sequence length."""
+    from semantic_search import chunk_text, get_embedder
+
+    tokenizer = get_embedder().tokenizer
+    text = " ".join(f"sentence number {i} about retrieval systems." for i in range(300))
+    chunks = chunk_text(text, tokenizer, max_tokens=200, overlap_tokens=30)
+
+    assert len(chunks) > 1
+    for c in chunks:
+        n = len(tokenizer(c, add_special_tokens=False)["input_ids"])
+        assert n <= 200, f"chunk had {n} tokens, over the 200 budget"
