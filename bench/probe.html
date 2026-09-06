@@ -1,0 +1,27 @@
+<!doctype html><meta charset="utf-8"><title>tokenizer probe</title>
+<pre id="o">running…</pre>
+<script type="module">
+import { AutoTokenizer, env } from
+  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js';
+const o = document.getElementById('o'); const say = s => { o.textContent += '\n'+s; };
+o.textContent = '';
+env.allowRemoteModels = true; env.allowLocalModels = false;
+const out = {};
+try {
+  const tk = await AutoTokenizer.from_pretrained('Xenova/all-MiniLM-L6-v2');
+  const text = "Configure the diffusion-weighted MRI (fMRI) pipeline in config.yaml.";
+  const enc = tk(text, { add_special_tokens:false, return_offsets_mapping:true });
+  out.encKeys = Object.keys(enc);
+  out.hasOffsets = 'offset_mapping' in enc;
+  out.offsetsSample = enc.offset_mapping ? JSON.stringify(enc.offset_mapping).slice(0,120) : null;
+  // does the low-level path expose offsets?
+  const m = tk._encode_text ? tk._encode_text(text) : null;
+  out.lowLevel = m ? JSON.stringify(m).slice(0,120) : 'n/a';
+  out.ids = Array.from(enc.input_ids.data ?? enc.input_ids).length;
+  out.tokens = tk.model.convert_ids_to_tokens
+      ? tk.model.convert_ids_to_tokens(Array.from(enc.input_ids.data ?? enc.input_ids)).slice(0,12)
+      : 'n/a';
+  say(JSON.stringify(out, null, 2));
+} catch (e) { say('ERROR ' + e); }
+await fetch('/result', { method:'POST', body: JSON.stringify(out, null, 2) });
+</script>

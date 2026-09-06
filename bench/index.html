@@ -1,0 +1,107 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser embedding benchmark</title>
+<style>
+  body{font:14px ui-monospace,SFMono-Regular,Menlo,monospace;margin:24px;max-width:900px;
+       background:#111;color:#ddd}
+  h1{font-size:16px} pre{background:#1b1b1b;padding:12px;border-radius:6px;overflow-x:auto;
+       white-space:pre-wrap;border:1px solid #333}
+  .ok{color:#5ec96b} .bad{color:#ff6b6b} .warn{color:#e8c15f}
+  button{font:inherit;padding:8px 14px;margin-right:8px;background:#2a2a2a;color:#ddd;
+         border:1px solid #444;border-radius:6px;cursor:pointer}
+</style>
+<h1>In-browser embedding throughput — all-MiniLM-L6-v2 (int8)</h1>
+<p>Native ONNX baseline on this machine: <b>127.0 chunks/s</b>. Same 512 chunks, same weights.</p>
+<button id="wasm">Run WASM</button><button id="webgpu">Run WebGPU</button>
+<pre id="log">ready.</pre>
+<script type="module">
+import { pipeline, env } from
+  'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.6/dist/transformers.min.js';
+
+const L = document.getElementById('log');
+const say = (s='') => { L.textContent += '\n' + s; console.log(s); };
+L.textContent = '';
+
+const REMOTE = new URLSearchParams(location.search).get('remote') === '1';
+env.allowRemoteModels = REMOTE;         // ?remote=1 -> fetch weights from the HF CDN
+env.allowLocalModels  = !REMOTE;
+env.localModelPath    = './models/';
+
+const BATCH = 64;                        // match the native measurement exactly
+const results = { env: {}, runs: [] };
+
+results.env = {
+  crossOriginIsolated: self.crossOriginIsolated,
+  hardwareConcurrency: navigator.hardwareConcurrency,
+  webgpu: !!navigator.gpu,
+  userAgent: navigator.userAgent,
+};
+say('--- environment ---');
+say(`crossOriginIsolated : ${self.crossOriginIsolated}   ${self.crossOriginIsolated
+      ? '(SharedArrayBuffer available -> multi-threaded wasm)'
+      : '(NO SAB -> SINGLE-THREADED wasm; number would be misleadingly low)'}`);
+say(`hardwareConcurrency : ${navigator.hardwareConcurrency}`);
+say(`navigator.gpu       : ${!!navigator.gpu}`);
+
+const cosine = (a,b) => { let s=0; for(let i=0;i<a.length;i++) s+=a[i]*b[i]; return s; };
+
+async function run(device){
+  say(`\n=== ${device.toUpperCase()} ===`);
+  const [chunks, reference] = await Promise.all([
+    fetch('chunks.json').then(r=>r.json()),
+    fetch('reference.json').then(r=>r.json()),
+  ]);
+
+  if (device === 'wasm' && env.backends?.onnx?.wasm)
+    env.backends.onnx.wasm.numThreads = self.crossOriginIsolated
+      ? Math.min(navigator.hardwareConcurrency, 8) : 1;
+
+  const t0 = performance.now();
+  let ex;
+  try {
+    ex = await pipeline('feature-extraction','Xenova/all-MiniLM-L6-v2',{ dtype: DTYPE, device });
+  } catch (e) { say(`<load failed> ${e}`); return null; }
+  const loadMs = performance.now() - t0;
+  say(`model load          : ${(loadMs/1000).toFixed(2)} s`);
+  const threads = env.backends?.onnx?.wasm?.numThreads ?? 'n/a';
+  say(`wasm threads        : ${threads}`);
+
+  // ---- CONTROL: do browser vectors match the native int8 vectors? ----
+  const ctl = await ex(chunks.slice(0,32), { pooling:'mean', normalize:true });
+  const dim = ctl.dims[1];
+  let lo = 1, sum = 0;
+  for (let i=0;i<32;i++){
+    const v = Array.from(ctl.data.slice(i*dim,(i+1)*dim));
+    const c = cosine(v, reference[i]);
+    sum += c; lo = Math.min(lo, c);
+  }
+  const meanCos = sum/32;
+  say(`control vs native   : mean cos ${meanCos.toFixed(6)}  min ${lo.toFixed(6)}  ` +
+      (meanCos > 0.99 ? '[OK faithful]' : '[MISMATCH - throughput not comparable]'));
+
+  // ---- warmup, then timed steady-state ----
+  await ex(chunks.slice(0,BATCH), { pooling:'mean', normalize:true });
+  const t1 = performance.now();
+  for (let s=0; s<chunks.length; s+=BATCH)
+    await ex(chunks.slice(s,s+BATCH), { pooling:'mean', normalize:true });
+  const secs = (performance.now()-t1)/1000;
+  const cps  = chunks.length/secs;
+  say(`embed ${chunks.length} chunks  : ${secs.toFixed(2)} s`);
+  say(`THROUGHPUT          : ${cps.toFixed(1)} chunks/s   (native 127.0 -> ${(cps/127).toFixed(2)}x)`);
+
+  const r = { device, dtype: DTYPE, threads, loadSec:+(loadMs/1000).toFixed(2), meanCos:+meanCos.toFixed(6),
+              minCos:+lo.toFixed(6), chunks:chunks.length, secs:+secs.toFixed(2),
+              chunksPerSec:+cps.toFixed(1), vsNative:+(cps/127).toFixed(2) };
+  r.remote = REMOTE;
+  results.runs.push(r);
+  await fetch('/result',{method:'POST',body:JSON.stringify(results,null,2)});
+  return r;
+}
+
+document.getElementById('wasm').onclick   = () => run('wasm');
+document.getElementById('webgpu').onclick = () => run('webgpu');
+const qs = new URLSearchParams(location.search);
+const DTYPE = qs.get('dtype') || 'q8';
+const auto = qs.get('auto');
+if (auto) run(auto);
+</script>
