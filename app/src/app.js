@@ -336,11 +336,19 @@ async function removeFile(fileId) {
 worker.onmessage = async ({ data: message }) => {
   switch (message.type) {
     case 'ready': {
-      const threads = message.threads ? `, ${message.threads} threads` : '';
-      dom.backend.textContent = `${message.backend}${threads}`;
-      dom.backend.title = message.crossOriginIsolated
-        ? 'Multi-threaded — cross-origin isolation is active.'
-        : 'Single-threaded: the required COOP/COEP headers are missing, so indexing is slower.';
+      // Thread count is a WASM concept. On the GPU path the forward pass does not
+      // run on WASM threads at all, so reporting one there is noise that hides the
+      // thing that does matter — the precision the weights were downloaded at.
+      const gpu = message.backend === 'webgpu';
+      dom.backend.textContent = gpu
+        ? `${message.backend} · ${message.dtype}`
+        : `${message.backend} · ${message.dtype}, ${message.threads ?? 1} threads`;
+      dom.backend.title = gpu
+        ? 'Running on the GPU — about 4x faster than the CPU path, and unaffected '
+          + 'by the COOP/COEP headers, which only govern multi-threaded WASM.'
+        : message.crossOriginIsolated
+          ? 'Multi-threaded — cross-origin isolation is active.'
+          : 'Single-threaded: the required COOP/COEP headers are missing, so indexing is slower.';
       break;
     }
 
