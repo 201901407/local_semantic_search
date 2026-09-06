@@ -853,8 +853,21 @@ threads) — **282 ms** to rerank 30 chunks.
 
 Extrapolated, *not* measured in a browser: §7 found WASM runs at **0.32x**
 native on this stack, which puts a top-30 rerank at roughly **0.9 s** on the CPU
-path. Search goes from ~5 ms to about a second. The WebGPU path should be
-several times faster but has not been measured for this model.
+path. Search goes from ~5 ms to about a second.
+
+> **The WebGPU path was never measured for this model, and shipping it anyway
+> was a mistake.** On a live deployment the reranker followed the embedder onto
+> WebGPU, scored every passage at ~0, and ranked *worse* than no reranking. The
+> load-time control did not catch it: it compares a database passage against a
+> bread recipe, and a badly degraded model still gets that ordering right. This
+> is §7's lesson a second time — an unmeasured device/dtype combination can run
+> to completion, report plausible timings, and return noise. The reranker is now
+> pinned to int8-on-WASM, the configuration these numbers describe.
+>
+> A three-way control was considered and rejected on measurement: this
+> cross-encoder is effectively binary. A plausibly on-topic passage scored
+> −11.19 against a bread recipe's −11.17, so there is no reliable middle rank
+> to test discrimination with.
 
 Note the shape of the cost: reranking runs once **per passage**, not once per
 query, so it scales with N and is paid on *every search* — unlike indexing,

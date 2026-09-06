@@ -76,7 +76,9 @@ async function loadModel() {
   backend = await pickBackend();
   const useWebGpu = backend.device === 'webgpu';
 
-  if (!useWebGpu && env.backends?.onnx?.wasm) {
+  // Set unconditionally: the reranker runs on WASM even when the embedder is on
+  // the GPU, so a GPU device still needs a sane thread count configured.
+  if (env.backends?.onnx?.wasm) {
     env.backends.onnx.wasm.numThreads = self.crossOriginIsolated
       ? Math.min(navigator.hardwareConcurrency || 4, 8)
       : 1;
@@ -227,8 +229,16 @@ async function loadReranker() {
   if (reranker) return reranker;
 
   const tokenizer = await AutoTokenizer.from_pretrained(RERANKER_ID);
+  // Pinned to the CPU path on purpose, even when the embedder is on the GPU.
+  // int8-on-WASM is the only configuration this reranker was ever measured in
+  // (+0.199 nDCG@10 on a real book). Following the embedder onto WebGPU shipped
+  // an unmeasured combination and it returned garbage in production: every
+  // passage scored ~0 and ranking was worse than no reranking at all. §7 taught
+  // this exact lesson about int8-on-WebGPU for the embedder; the reranker gets
+  // the same rule. Reranking 30 short pairs on CPU costs about a second, which
+  // is the budget already quoted to the reader.
   const model = await AutoModelForSequenceClassification.from_pretrained(
-    RERANKER_ID, backend ?? { device: 'wasm', dtype: 'q8' });
+    RERANKER_ID, { device: 'wasm', dtype: 'q8' });
   const candidate = { tokenizer, model };
 
   const [relevant, irrelevant] = await scoreWith(

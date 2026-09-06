@@ -38,7 +38,7 @@ There is no server-side processing. The whole application is a static page.
 | D20 | Dev server port | **Fixed at 8768**, fails rather than drifting | IndexedDB is origin-scoped; a different port is a different, empty index | — |
 | D21 | Reranking | **Cross-encoder rerank of the top 30, int8, behind a toggle** | +0.064 nDCG (SciFact) and +0.199 (DDIA), both p < 0.001 — the only significant quality lever measured | §9, §10 |
 | D22 | Rerank depth | 30 candidates | N=10 significantly too shallow on both corpora; 20–100 indistinguishable, so depth is a latency choice | §9.4, §10.3 |
-| D23 | Reranker precision | int8 (23.1 MB), lazily fetched on first search | Keeps the gain (corr 0.9996 with fp32) at a quarter of the download | §9.6 |
+| D23 | Reranker precision | int8 on **WASM always**, even when the embedder is on WebGPU | Keeps the gain (corr 0.9996 with fp32) at a quarter of the download — and is the only configuration ever measured. Following the embedder onto WebGPU returned garbage in production | §9.6 |
 | D24 | Book furniture | Contents, index and bibliography **demoted, never deleted** | Citation titles outrank the prose that explains them; score is bimodal, cutoff 25 sits in the gap | — |
 | D25 | Result excerpts | Window chosen by distinct query terms covered, snapped to word boundaries | Naive leading excerpts surfaced text that did not contain the answer | — |
 | D26 | Result count | User-controlled, 1–10, default 5 | Inputs are dynamic; the right depth is the reader's call, and re-ranking is free from cache | — |
