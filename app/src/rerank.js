@@ -81,7 +81,7 @@ export const controlPasses = (relevantLogit, irrelevantLogit) =>
 export function applyRerank(hits, logits) {
   return hits
     .map((hit, index) => (index < logits.length
-      ? { ...hit, score: sigmoid(logits[index]), reranked: true }
+      ? { ...hit, score: sigmoid(logits[index]), logit: logits[index], reranked: true }
       : { ...hit }))
     .sort((a, b) => b.score - a.score);
 }

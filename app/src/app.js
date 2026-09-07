@@ -224,7 +224,11 @@ async function renderResults(hits, terms) {
     const card = el('div', 'result');
     const head = el('div', 'head');
     head.append(el('span', 'src', files.get(hit.fileId)?.name ?? 'Unknown file'));
-    head.append(el('span', 'score', hit.score.toFixed(2)));
+    const score = el('span', 'score', hit.score.toFixed(2));
+    score.title = hit.reranked
+      ? `Cross-encoder relevance ${hit.score.toFixed(4)} (logit ${Number(hit.logit).toFixed(3)})`
+      : `Cosine similarity ${hit.score.toFixed(4)}`;
+    head.append(score);
     card.append(head);
 
     const body = el('div', 'text');
