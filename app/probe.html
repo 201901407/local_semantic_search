@@ -1,0 +1,12 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>rerank diagnostic</title>
+<style>body{font:13px/1.6 ui-monospace,Menlo,monospace;background:#111;color:#ddd;padding:18px}
+input{font:inherit;background:#1c1c1c;color:#ddd;border:1px solid #333;padding:6px 8px;width:min(420px,60vw)}
+button{font:inherit;background:#2a5;color:#000;border:0;padding:6px 14px;cursor:pointer}
+pre{white-space:pre-wrap;word-break:break-word}</style>
+</head><body>
+<p>Runs the real search pipeline over documents already indexed in this browser.
+Nothing is uploaded; nothing is re-indexed.</p>
+<p><input id="q" value="what is partitioning"> <button id="go">Run</button></p>
+<pre id="out">loading your index…
+</pre>
+<script type="module" src="./probe.js"></script></body></html>
